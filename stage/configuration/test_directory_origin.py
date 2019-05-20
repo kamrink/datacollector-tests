@@ -744,10 +744,51 @@ def test_directory_origin_configuration_number_of_threads(sdc_builder, sdc_execu
 @pytest.mark.parametrize('data_format', ['LOG'])
 @pytest.mark.parametrize('log_format', ['LOG4J'])
 @pytest.mark.parametrize('on_parse_error', ['ERROR', 'IGNORE', 'INCLUDE_AS_STACK_TRACE'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_on_parse_error(sdc_builder, sdc_executor,
-                                                       data_format, log_format, on_parse_error):
-    pass
+def test_directory_origin_configuration_on_parse_error(sdc_builder, sdc_executor, data_format,
+                                    log_format, on_parse_error, shell_executor, file_writer):
+    """In below 3 lines 1st and 3rd lines are in the default Log4J format 2nd is some random format.
+    ERROR -- output_records is empty when any line in file_contents is invalid Log4J otherwise
+    output_records contains all lines present in the file_contents.
+    IGNORE -- Lines which are in the correct format only present in output_records.
+    INCLUDE_AS_STACK_TRACE -- Includes information that cannot be parsed as a stack trace to the
+    previously-read log line The information is added to the message field for the last valid log line.
+    """
+    files_directory = os.path.join('/tmp', get_random_string())
+    file_name = f'{get_random_string()}.txt'
+    file_path = os.path.join(files_directory, file_name)
+    file_contents = '\n'.join(['0 [main] ERROR test.pack.Log4J  - first message',
+                               '0 DEBUG test.pack.Log4J  - second message',
+                               '1 [main] DEBUG test.pack.Log4J  - third message'])
+    try:
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(file_path, file_contents)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory')
+        directory.set_attributes(log_format=log_format,
+                                 on_parse_error=on_parse_error,
+                                 data_format=data_format,
+                                 files_directory=files_directory,
+                                 file_name_pattern=file_name)
+        trash = pipeline_builder.add_stage('Trash')
+        directory >> trash
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        output_records = snapshot[directory.instance_name].output
+
+        if on_parse_error == 'ERROR':
+            assert output_records == []
+        elif on_parse_error == 'IGNORE':
+            assert output_records[0].field['message'] == 'first message'
+            assert output_records[1].field['message'] == 'third message'
+        else:
+            assert output_records[0].field['message'] == 'first message\n0 DEBUG test.pack.Log4J  - second message'
+            assert output_records[1].field['message'] == 'third message'
+    finally:
+        shell_executor(f'rm -r {files_directory}')
+        sdc_executor.stop_pipeline(pipeline)
 
 
 @pytest.mark.parametrize('on_record_error', ['DISCARD', 'STOP_PIPELINE', 'TO_ERROR'])
