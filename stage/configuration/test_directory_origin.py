@@ -750,10 +750,49 @@ def test_directory_origin_configuration_on_parse_error(sdc_builder, sdc_executor
     pass
 
 
-@pytest.mark.parametrize('on_record_error', ['DISCARD', 'STOP_PIPELINE', 'TO_ERROR'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_on_record_error(sdc_builder, sdc_executor, on_record_error):
-    pass
+@pytest.mark.parametrize('on_record_error', ['DISCARD', 'TO_ERROR'])
+def test_directory_origin_configuration_on_record_error(sdc_builder, sdc_executor, on_record_error,
+                                                        shell_executor, file_writer):
+    """comment
+    'DISCARD', 'STOP_PIPELINE', 'TO_ERROR'
+    """
+    files_directory = os.path.join('/tmp', get_random_string())
+    file_name = f'{get_random_string()}.log'
+    file_path = os.path.join(files_directory, file_name)
+    file_contents = '\n'.join(['0 [main] ERROR test.pack.Log4J  - first message',
+                               '0 DEBUG test.pack.Log4J  - second message',
+                               '1 [main] DEBUG test.pack.Log4J  - third message'])
+    try:
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(file_path, file_contents)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory')
+        directory.set_attributes(on_record_error=on_record_error,
+                                 log_format='LOG4J',
+                                 data_format='LOG',
+                                 files_directory=files_directory,
+                                 file_name_pattern='*.log',
+                                 file_name_pattern_mode='GLOB')
+        trash = pipeline_builder.add_stage('Trash')
+        directory >> trash
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        output_records = snapshot[directory.instance_name].output
+        error_records = [error_record.field['columns'] for error_record in snapshot[directory].error_records]
+
+        print('on_record_error ', on_record_error)
+        print(output_records)
+        print("error_records ", error_records)
+        print(snapshot[directory].error_records)
+
+        # if on_parse_error == 'ERROR':
+        #     assert
+    finally:
+        # shell_executor(f'rm -r {files_directory}')
+        sdc_executor.stop_pipeline(pipeline)
 
 
 @pytest.mark.parametrize('data_format', ['XML'])
