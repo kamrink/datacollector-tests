@@ -52,6 +52,7 @@ def test_jdbc_multitable_consumer_origin_configuration_batches_from_result_set(s
                       'number_of_threads': 2, 'maximum_pool_size': 2}
         jdbc_multitable_consumer, pipeline = get_jdbc_multitable_consumer_to_trash_pipeline(sdc_builder, database,
                                                                                             attributes)
+        pipeline.delivery_guarantee = 'AT_MOST_ONCE'
 
         # Execute pipeline and get the snapshot
         snapshot = execute_pipeline(sdc_executor, pipeline, 8, 5)
@@ -62,6 +63,7 @@ def test_jdbc_multitable_consumer_origin_configuration_batches_from_result_set(s
         rows_from_snapshot = [tuples_to_lower_name(list(record.field.items())[1])
                               for record in snapshot_contents]
 
+        # Assert data from 2 threads. Check records and tables read by each thread.
         threads = {}
         for record in snapshot_contents:
             header = record.header.values
@@ -71,9 +73,9 @@ def test_jdbc_multitable_consumer_origin_configuration_batches_from_result_set(s
             threads[thread_number]['tables'].append(header['jdbc.tables'])
             threads[thread_number]['records'].append(tuples_to_lower_name(list(record.field.items())[1]))
         assert len(rows_from_snapshot) == len(rows_in_database)
-        for thread_number, thread_info in thread_number.items():
-            assert len(set(thread_info['tables'])) == 2
-            assert len(thread_info['records']) == 20
+        for thread_number, thread_info in threads.items():
+            assert len(set(thread_info['tables'])) >= 1
+            assert len(thread_info['records']) < 40
     finally:
         sdc_executor.stop_pipeline(pipeline)
         for table in tables:
