@@ -41,21 +41,25 @@ def test_jdbc_multitable_consumer_origin_configuration_batches_from_result_set(s
     rows_in_database = []
     try:
         # Create 4 tables and insert 10 records
+        prefix_list = ['a', 'b', 'c', 'd']
         for table_number in range(0, 4):
-            rows_in_table, table = create_table_and_insert_data(database, src_table_prefix, 10, table_number)
+            rows_in_table, table = create_table_and_insert_data(database,
+                                                                '{}_{}'.format(prefix_list[table_number],
+                                                                               src_table_prefix), 20, table_number)
             tables.append(table)
             rows_in_database = rows_in_database + rows_in_table
 
         # Build the pipeline
         attributes = {'table_configs': [{"tablePattern": f'%{src_table_prefix}%'}],
-                      'per_batch_strategy': per_batch_strategy, 'batches_from_result_set': 5,
-                      'number_of_threads': 2, 'maximum_pool_size': 2}
+                      'per_batch_strategy': 'SWITCH_TABLES', 'batches_from_result_set': 2,
+                      'number_of_threads': 2, 'maximum_pool_size': 2, 'result_set_cache_size': 10,
+                      'initial_table_order_strategy': 'ALPHABETICAL'}
         jdbc_multitable_consumer, pipeline = get_jdbc_multitable_consumer_to_trash_pipeline(sdc_builder, database,
                                                                                             attributes)
         pipeline.delivery_guarantee = 'AT_MOST_ONCE'
 
         # Execute pipeline and get the snapshot
-        snapshot = execute_pipeline(sdc_executor, pipeline, 8, 5)
+        snapshot = execute_pipeline(sdc_executor, pipeline, 16, 5)
 
         # Column names are converted to lower case since Oracle database column names are in upper case.
         tuples_to_lower_name = lambda tup: (tup[0].lower(), tup[1])
@@ -72,15 +76,16 @@ def test_jdbc_multitable_consumer_origin_configuration_batches_from_result_set(s
                 threads[thread_number] = {'tables': [], 'records': []}
             threads[thread_number]['tables'].append(header['jdbc.tables'])
             threads[thread_number]['records'].append(tuples_to_lower_name(list(record.field.items())[1]))
-        assert len(rows_from_snapshot) == len(rows_in_database)
+        # This assertion will check if the two batches are getting created from result set.
+        assert threads['0']['tables'][0] == threads['0']['tables'][5]
+        assert threads['1']['tables'][0] == threads['1']['tables'][5]
+        # Following assertions will check if the threads are reading more than 1 table.
         for thread_number, thread_info in threads.items():
             assert len(set(thread_info['tables'])) >= 1
-            assert len(thread_info['records']) < 40
+            assert len(thread_info['records']) > 0
     finally:
         sdc_executor.stop_pipeline(pipeline)
-        for table in tables:
-            logger.info('Dropping table %s in %s database...', table.name, database.type)
-            table.drop(database.engine)
+        delete_table(tables, database)
 
 
 @pytest.mark.skip('Not yet implemented')
@@ -316,3 +321,9 @@ def create_table_and_insert_data(database, src_table_prefix, number_of_records, 
     table = create_table(database, columns, table_name)
     insert_data_in_table(database, table, rows_in_table)
     return rows_in_table, table
+
+
+def delete_table(tables, database):
+    for table in tables:
+        logger.info('Dropping table %s in %s database...', table.name, database.type)
+        table.drop(database.engine)
