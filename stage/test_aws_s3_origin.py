@@ -860,3 +860,329 @@ def test_s3_compressed_file_offset(sdc_builder, sdc_executor, aws):
         delete_keys = {'Objects': [{'Key': k['Key']}
                                    for k in client.list_objects_v2(Bucket=s3_bucket)['Contents']]}
         client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
+
+
+@aws('s3')
+@pytest.mark.parametrize('records_per_file', [10, 1000, 10000])
+def test_s3_origin_timestamp_last_file_offset(sdc_builder, sdc_executor, aws, records_per_file):
+    """Test that the last file offset (-1) is properly committed. When using TIMESTAMP ordering, last file
+    is duplicated when restarting the pipeline.
+
+    The pipeline looks like:
+
+    S3 Origin pipeline:
+        s3_origin >> trash
+        s3_origin >= pipeline_finished_executor
+    """
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+
+    # Create test data files
+    data_file_first_filename = 'data-file-first.txt'
+    test_data_first = [f'First Message {i}' for i in range(records_per_file)]
+
+    data_file_second_filename = 'data-file-second.txt'
+    test_data_second = [f'Second  Message {i}' for i in range(records_per_file)]
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.set_attributes(bucket=aws.s3_bucket_name, data_format='TEXT',
+                             prefix_pattern=f'{s3_key}/*',
+                             max_batch_size_in_records=1000,
+                             read_order='TIMESTAMP')
+    trash = builder.add_stage('Trash')
+
+    pipeline_finished_executor = builder.add_stage('Pipeline Finisher Executor')
+    pipeline_finished_executor.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    s3_origin >> trash
+    s3_origin >= pipeline_finished_executor
+
+    s3_origin_pipeline = builder.build(title='Amazon S3 origin multithreaded pipeline').configure_for_environment(aws)
+    s3_origin_pipeline.configuration['shouldRetry'] = False
+    sdc_executor.add_pipeline(s3_origin_pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/{data_file_first_filename}',
+                          Body='\n'.join(test_data_first).encode('ascii'))
+        client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/{data_file_second_filename}',
+                          Body='\n'.join(test_data_second).encode('ascii'))
+
+        # Read files once
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_finished()
+
+        # Verify read data
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == records_per_file*2
+
+        # Start pipeline again, wait some time and assert that no duplicated data has been read
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_finished(timeout_sec=30)
+
+        # Assert no more data has been read on the second run
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == 0
+
+    finally:
+        # If no files have been processed we need to stop the pipeline, otherwise it will be finished
+        if sdc_executor.get_pipeline_status(s3_origin_pipeline).response.json().get('status') == 'RUNNING':
+            sdc_executor.stop_pipeline(s3_origin_pipeline, force=True)
+        # Clean up S3.
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in
+                                   client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)
+
+
+@aws('s3')
+@pytest.mark.parametrize('read_order', ['LEXICOGRAPHICAL', 'TIMESTAMP'])
+def test_s3_restart_with_file_offset(sdc_builder, sdc_executor, aws, read_order):
+
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+    records_per_file = 100_000
+
+    # Create test data files
+    data_file_filename = 'big-data-file.txt'
+    test_data = [f'Message {i}' for i in range(records_per_file)]
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.set_attributes(bucket=aws.s3_bucket_name, data_format='TEXT',
+                             prefix_pattern=f'{s3_key}/*',
+                             read_order=read_order,
+                             max_batch_size_in_records=100)
+    trash = builder.add_stage('Trash')
+
+    pipeline_finished_executor = builder.add_stage('Pipeline Finisher Executor')
+    pipeline_finished_executor.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    s3_origin >> trash
+    s3_origin >= pipeline_finished_executor
+
+    s3_origin_pipeline = builder.build(title='Amazon S3 origin multithreaded pipeline').configure_for_environment(aws)
+    s3_origin_pipeline.configuration['shouldRetry'] = False
+    sdc_executor.add_pipeline(s3_origin_pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/{data_file_filename}',
+                          Body='\n'.join(test_data).encode('ascii'))
+
+        # Read 2 batches & stop the pipeline halfway through the file
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_pipeline_batch_count(2)
+        sdc_executor.stop_pipeline(s3_origin_pipeline)
+
+        # Check amount of records read so far
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        input_records = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+
+        # Restart the pipeline and wait until it reads all data
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_finished(timeout_sec=150)
+
+        # Check amount of records read in the second run
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        input_records_second = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+
+        # Assert records_per_file have been read
+        assert records_per_file == input_records + input_records_second
+
+    finally:
+        # If no files have been processed we need to stop the pipeline, otherwise it will be finished
+        if sdc_executor.get_pipeline_status(s3_origin_pipeline).response.json().get('status') == 'RUNNING':
+            sdc_executor.stop_pipeline(s3_origin_pipeline, force=True)
+        # Clean up S3.
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in
+                                   client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)
+
+# SDC-11925: Allow specifying subset of sheets to import when reading Excel files
+@aws('s3')
+@sdc_min_version('3.10.0')
+@pytest.mark.parametrize('read_all_sheets', [True, False])
+def test_s3_excel_sheet_selection(sdc_builder, sdc_executor, aws, read_all_sheets):
+    """Ensure that configuring subset of sheets to import properly works."""
+    s3_bucket = aws.s3_bucket_name
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+
+    # Create the Excel file on the fly
+    file_excel = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.add_sheet('A')
+    sheet.write(0, 0, 'A')
+    sheet.write(1, 0, 'a')
+    sheet = workbook.add_sheet('B')
+    sheet.write(0, 0, 'B')
+    sheet.write(1, 0, 'b')
+    workbook.save(file_excel)
+    file_excel.seek(0)
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.bucket = s3_bucket
+    s3_origin.data_format = 'EXCEL'
+    s3_origin.prefix_pattern = f'{s3_key}*'
+    s3_origin.excel_header_option = 'WITH_HEADER'
+    s3_origin.read_all_sheets = read_all_sheets
+    s3_origin.import_sheets = ['A']
+
+    trash = builder.add_stage('Trash')
+
+    s3_origin >> trash
+
+    pipeline = builder.build().configure_for_environment(aws)
+    sdc_executor.add_pipeline(pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.upload_fileobj(Bucket=s3_bucket, Key=f'{s3_key}', Fileobj=file_excel)
+
+        # Snapshot the pipeline and compare the records.
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        if read_all_sheets:
+            assert len(snapshot[s3_origin].output) == 2
+        else:
+            assert len(snapshot[s3_origin].output) == 1
+
+        assert snapshot[s3_origin].output[0].get_field_data('/A') == 'a'
+        if read_all_sheets:
+            assert snapshot[s3_origin].output[1].get_field_data('/B') == 'b'
+
+    finally:
+        # Clean up S3.
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
+
+
+# SDC-11926: Add ability to skip cells that have no associated header when reading from Excel
+@aws('s3')
+@sdc_min_version('3.10.0')
+@pytest.mark.parametrize('skip', [True, False])
+def test_s3_excel_skip_cells_missing_header(sdc_builder, sdc_executor, aws, skip):
+    """Ensure that configuration option skip cells with missing header works properly."""
+    s3_bucket = aws.s3_bucket_name
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+
+    # Create the Excel file on the fly
+    file_excel = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.add_sheet('A')
+    sheet.write(0, 0, 'A')
+    sheet.write(1, 0, 'a')
+    sheet.write(1, 2, 'extra value with no header')
+    workbook.save(file_excel)
+    file_excel.seek(0)
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.bucket = s3_bucket
+    s3_origin.data_format = 'EXCEL'
+    s3_origin.prefix_pattern = f'{s3_key}*'
+    s3_origin.excel_header_option = 'WITH_HEADER'
+    s3_origin.skip_cells_with_no_header = skip
+
+    trash = builder.add_stage('Trash')
+
+    s3_origin >> trash
+
+    pipeline = builder.build().configure_for_environment(aws)
+    sdc_executor.add_pipeline(pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.upload_fileobj(Bucket=s3_bucket, Key=f'{s3_key}', Fileobj=file_excel)
+
+        # Snapshot the pipeline and compare the records.
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert len(snapshot[s3_origin].output) == 1
+        assert snapshot[s3_origin].output[0].get_field_data('/A') == 'a'
+
+        if skip:
+            # Unclear how validate if given path doesn't exists
+            with pytest.raises(Exception) as ex:
+                snapshot[s3_origin].output[0].get_field_data('/2')
+        else:
+            assert snapshot[s3_origin].output[0].get_field_data('/2') == 'extra value with no header'
+
+    finally:
+        # Clean up S3.
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
+
+# SDC-11924: Better handling of various error header states in Excel parser
+@aws('s3')
+@sdc_min_version('3.10.0')
+def test_s3_excel_parsing_incomplete_header(sdc_builder, sdc_executor, aws):
+    """Ensure that incomplete header won't cause pipeline failure."""
+    s3_bucket = aws.s3_bucket_name
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+
+    # Create the Excel file on the fly
+    file_excel = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.add_sheet('A')
+    sheet.write(0, 0, 'A')
+    # Second column is completely missing for header row
+    sheet.write(0, 2, 'C')
+    sheet.write(1, 0, 'a')
+    sheet.write(1, 1, 'b')
+    sheet.write(1, 2, 'c')
+    workbook.save(file_excel)
+    file_excel.seek(0)
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.bucket = s3_bucket
+    s3_origin.data_format = 'EXCEL'
+    s3_origin.prefix_pattern = f'{s3_key}*'
+    s3_origin.excel_header_option = 'WITH_HEADER'
+
+    trash = builder.add_stage('Trash')
+
+    s3_origin >> trash
+
+    pipeline = builder.build().configure_for_environment(aws)
+    sdc_executor.add_pipeline(pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.upload_fileobj(Bucket=s3_bucket, Key=f'{s3_key}', Fileobj=file_excel)
+
+        # Snapshot the pipeline and compare the records.
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert len(snapshot[s3_origin].output) == 1
+        assert snapshot[s3_origin].output[0].get_field_data('/A') == 'a'
+        assert snapshot[s3_origin].output[0].get_field_data('/C') == 'c'
+
+    finally:
+        # Clean up S3.
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)

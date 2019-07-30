@@ -28,13 +28,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_SCHEMA_NAME = 'dbo'
 
 
-def setup_table(connection, schema_name, table_name, sample_data=None):
+def setup_table(connection, schema_name, table_name, sample_data=None, capture_instance_name=None):
     """Create table and insert the sample data into the table"""
     table = create_table(connection, schema_name, table_name)
 
+    if capture_instance_name is None:
+      capture_instance_name = f'{schema_name}_{table_name}'
+
     logger.info('Enabling CDC on %s.%s...', schema_name, table_name)
     connection.execute(f'exec sys.sp_cdc_enable_table @source_schema=\'{schema_name}\', '
-                       f'@source_name=\'{table_name}\', @supports_net_changes=1, @role_name=NULL')
+                       f'@source_name=\'{table_name}\', '
+                       f'@capture_instance=\'{capture_instance_name}\', '
+                       f'@supports_net_changes=1, @role_name=NULL')
 
     if sample_data is not None:
         add_data_to_table(connection, table, sample_data)
@@ -292,6 +297,81 @@ def test_sql_server_cdc_with_nonempty_initial_offset(sdc_builder, sdc_executor, 
         sql_server_cdc.set_attributes(table_configs=[{'capture_instance': capture_instance_name,
             'initialOffset': currentLSN.decode("utf-8")}],
             use_direct_table_query = use_table
+        )
+
+        # create the destination table
+        dest_table_name = get_random_string(string.ascii_uppercase, 9)
+        dest_table = create_table(database, DEFAULT_SCHEMA_NAME, dest_table_name)
+
+        jdbc_producer = pipeline_builder.add_stage('JDBC Producer')
+
+        jdbc_producer.set_attributes(schema_name=DEFAULT_SCHEMA_NAME,
+                                     table_name=dest_table_name,
+                                     default_operation='INSERT',
+                                     field_to_column_mapping=[])
+
+        sql_server_cdc >> jdbc_producer
+        pipeline = pipeline_builder.build().configure_for_environment(database)
+        sdc_executor.add_pipeline(pipeline)
+
+        # wait for data captured by cdc jobs in sql server before starting the pipeline
+        ct_table_name = f'{capture_instance_name}_CT'
+
+        sdc_executor.start_pipeline(pipeline).wait_for_pipeline_output_records_count(second_no_of_records)
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert_table_replicated(database, rows_in_database[first_no_of_records:total_no_of_records], DEFAULT_SCHEMA_NAME, dest_table_name)
+
+    finally:
+        if table is not None:
+            logger.info('Dropping table %s in %s database...', table, database.type)
+            table.drop(database.engine)
+
+        if dest_table is not None:
+            logger.info('Dropping table %s in %s database...', dest_table, database.type)
+            dest_table.drop(database.engine)
+
+        if connection is not None:
+            connection.close()
+
+
+@database('sqlserver')
+@pytest.mark.timeout(180)
+def test_sql_server_cdc_with_zero_initial_offset(sdc_builder, sdc_executor, database):
+    """Test for SQL Server CDC origin stage with "0x0" initial offset
+
+    The pipeline looks like:
+        sql_server_cdc_origin >> jdbc_producer
+    """
+    if not database.is_cdc_enabled:
+        pytest.skip('Test only runs against SQL Server with CDC enabled.')
+
+    try:
+        connection = database.engine.connect()
+        schema_name = DEFAULT_SCHEMA_NAME
+        first_no_of_records = 3
+        second_no_of_records = 8
+        total_no_of_records = first_no_of_records + second_no_of_records
+        rows_in_database = setup_sample_data(total_no_of_records)
+
+        # create the table and insert the first half of the rows
+        table_name = get_random_string(string.ascii_lowercase, 20)
+        capture_instance_name = f'{schema_name}_{table_name}'
+        table = setup_table(connection, schema_name, table_name, rows_in_database[0:first_no_of_records])
+        ct_table_name = f'{capture_instance_name}_CT'
+        wait_for_data_in_ct_table(ct_table_name, first_no_of_records, database)
+
+        # insert the last half of the sample data
+        add_data_to_table(connection, table, rows_in_database[first_no_of_records:total_no_of_records])
+        wait_for_data_in_ct_table(ct_table_name, total_no_of_records, database)
+
+        # get the capture_instance_name
+        capture_instance_name = f'{schema_name}_{table_name}'
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        sql_server_cdc = pipeline_builder.add_stage('SQL Server CDC Client')
+        sql_server_cdc.set_attributes(table_configs=[{'capture_instance': capture_instance_name,
+            'initialOffset': '0'}]
         )
 
         # create the destination table
@@ -673,7 +753,6 @@ def test_sql_server_cdc_no_more_events(sdc_builder, sdc_executor, database):
 
         rows_in_database = setup_sample_data(total_no_of_records)
 
-        logger.info("****")
         logger.info(rows_in_database)
 
         table_name = get_random_string(string.ascii_lowercase, 20)
@@ -728,6 +807,151 @@ def test_sql_server_cdc_no_more_events(sdc_builder, sdc_executor, database):
         history = sdc_executor.get_pipeline_history(pipeline)
         msgs_sent_count = history.latest.metrics.counter('stage.Trash_02.outputRecords.counter').count
         assert msgs_sent_count == 2
+    finally:
+        if table is not None:
+            logger.info('Dropping table %s in %s database...', table, database.type)
+            table.drop(database.engine)
+
+        if connection is not None:
+            connection.close()
+
+
+@database('sqlserver')
+@pytest.mark.timeout(180)
+def test_sql_server_cdc_source_table_in_record_header(sdc_builder, sdc_executor, database):
+    """Test for SQL Server CDC origin stage puts the source table in a record header attribute,
+        * jdbc.cdc.source_schema_name = <source schema>
+        * jdbc.cdc.source_name = <source table>
+
+    The pipeline looks like:
+        sql_server_cdc_origin >> trash
+    """
+    table = None
+    connection = None
+    if not database.is_cdc_enabled:
+        pytest.skip('Test only runs against SQL Server with CDC enabled.')
+
+    try:
+        connection = database.engine.connect()
+        total_no_of_records = 1
+
+        rows_in_database = setup_sample_data(total_no_of_records)
+
+        table_name = get_random_string(string.ascii_lowercase, 20)
+        schema_name = get_random_string(string.ascii_lowercase, 3)
+        capture_instance_name = get_random_string(string.ascii_lowercase, 20)
+
+        # create schema & table
+        connection.execute(f'CREATE SCHEMA {schema_name}')
+        table = setup_table(connection, schema_name, table_name,
+            rows_in_database[0:1], capture_instance_name)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        sql_server_cdc = pipeline_builder.add_stage('SQL Server CDC Client')
+        sql_server_cdc.set_attributes(fetch_size=1,
+            max_batch_size_in_records=1,
+            table_configs=[{'capture_instance': capture_instance_name}]
+        )
+
+        trash = pipeline_builder.add_stage('Trash')
+
+        sql_server_cdc >> trash
+
+        pipeline = pipeline_builder.build().configure_for_environment(database)
+        sdc_executor.add_pipeline(pipeline)
+
+        # wait for data captured by cdc jobs in sql server before capturing the pipeline
+        ct_table_name = f'{capture_instance_name}_CT'
+        wait_for_data_in_ct_table(ct_table_name, total_no_of_records/2, database)
+
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        # assert all the data captured have the same raw_data
+        for record in snapshot.snapshot_batches[0][sql_server_cdc.instance_name].output:
+            assert record.field['id'] == rows_in_database[0].get('id')
+            assert record.field['name'] == rows_in_database[0].get('name')
+            assert record.field['dt'] == rows_in_database[0].get('dt')
+            assert record.header['values']['jdbc.cdc.source_schema_name'] == schema_name
+            assert record.header['values']['jdbc.cdc.source_name'] == table_name
+    finally:
+        if table is not None:
+            logger.info('Dropping table %s in %s database...', table, database.type)
+            table.drop(database.engine)
+
+        if schema_name is not None:
+            logger.info('Dropping schema %s in %s database...', schema_name, database.type)
+            connection.execute(f'drop schema {schema_name}')
+
+        if connection is not None:
+            connection.close()
+
+
+@database('sqlserver')
+@sdc_min_version('3.8.0')
+@pytest.mark.timeout(180)
+def test_sql_server_cdc_starting_without_operation_committed_offset(sdc_builder, sdc_executor, database):
+    """Test for SQL Server CDC origin stage runningn on missing __$operation in the committed offset
+        __$operation field was introduced after 3.8.0
+
+    The pipeline looks like:
+        sql_server_cdc_origin >> trash
+    """
+    table = None
+    connection = None
+    if not database.is_cdc_enabled:
+        pytest.skip('Test only runs against SQL Server with CDC enabled.')
+
+    try:
+        connection = database.engine.connect()
+        total_no_of_records = 1
+
+        rows_in_database = setup_sample_data(total_no_of_records)
+
+        table_name = get_random_string(string.ascii_lowercase, 20)
+        # get the capture_instance_name
+        capture_instance_name = f'{DEFAULT_SCHEMA_NAME}_{table_name}'
+
+        # create schema & table
+        table = setup_table(connection, DEFAULT_SCHEMA_NAME, table_name, rows_in_database)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        sql_server_cdc = pipeline_builder.add_stage('SQL Server CDC Client')
+        sql_server_cdc.set_attributes(fetch_size=1,
+            max_batch_size_in_records=1,
+            table_configs=[{'capture_instance': capture_instance_name}]
+        )
+
+        trash = pipeline_builder.add_stage('Trash')
+
+        sql_server_cdc >> trash
+
+        pipeline = pipeline_builder.build().configure_for_environment(database)
+        sdc_executor.add_pipeline(pipeline)
+
+        # We hard code offset to be pre-migration to multi-threaded origin and thus forcing the origin to upgrade it
+        offset = {
+            'version' : 2,
+            'offsets' : {
+                '$com.streamsets.pipeline.stage.origin.jdbc.CDC.sqlserver.SQLServerCDCSource.offset.version$' : '1',
+                f'tableName=cdc.{capture_instance_name}_CT;;;partitioned=false;;;partitionSequence=-1;;;partitionStartOffsets=;;;partitionMaxOffsets=;;;usingNonIncrementalLoad=false' : '__$seqval=0::__$start_lsn=0'
+            }
+        }
+
+        sdc_executor.api_client.update_pipeline_committed_offsets(pipeline.id, body=offset)
+
+        # wait for data captured by cdc jobs in sql server before capturing the pipeline
+        ct_table_name = f'{capture_instance_name}_CT'
+        wait_for_data_in_ct_table(ct_table_name, total_no_of_records, database)
+
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        # assert all the data captured have the same raw_data
+        for record in snapshot.snapshot_batches[0][sql_server_cdc.instance_name].output:
+            assert record.field['id'] == rows_in_database[0].get('id')
+            assert record.field['name'] == rows_in_database[0].get('name')
+            assert record.field['dt'] == rows_in_database[0].get('dt')
     finally:
         if table is not None:
             logger.info('Dropping table %s in %s database...', table, database.type)

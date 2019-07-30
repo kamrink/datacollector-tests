@@ -114,7 +114,7 @@ def test_kinesis_consumer_at_timestamp(sdc_builder, sdc_executor, aws):
 
         # 2. Wait and store timestamp
         time.sleep(10)
-        timestamp = int(time.time())*1000
+        timestamp = int(time.time()) * 1000
 
         # 3. Publish new data
         put_records = [{'Data': f'Second Message {i}', 'PartitionKey': '111'} for i in range(10)]
@@ -148,10 +148,85 @@ def test_kinesis_consumer_at_timestamp(sdc_builder, sdc_executor, aws):
 
 
 @aws('kinesis')
+def test_kinesis_consumer_stop_resume(sdc_builder, sdc_executor, aws):
+    """Test for Kinesis consumer origin stage. We do so by publishing data to a test stream using Kinesis client and
+    having a pipeline which reads that data using Kinesis consumer origin stage. Data is then asserted for what is
+    published at Kinesis client and what we read in the pipeline snapshot. The pipeline looks like:
+
+    Kinesis Consumer pipeline:
+        kinesis_consumer >> trash
+    """
+    # build consumer pipeline
+    application_name = get_random_string(string.ascii_letters, 10)
+    stream_name = '{}_{}'.format(aws.kinesis_stream_prefix, get_random_string(string.ascii_letters, 10))
+
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    kinesis_consumer = builder.add_stage('Kinesis Consumer')
+    kinesis_consumer.set_attributes(application_name=application_name, data_format='TEXT',
+                                    initial_position='TRIM_HORIZON',
+                                    stream_name=stream_name)
+
+    trash = builder.add_stage('Trash')
+
+    kinesis_consumer >> trash
+
+    consumer_origin_pipeline = builder.build(title='Kinesis Consumer Stop Resume').configure_for_environment(aws)
+    sdc_executor.add_pipeline(consumer_origin_pipeline)
+
+    # run pipeline and capture snapshot
+    client = aws.kinesis
+    try:
+        logger.info('Creating %s Kinesis stream on AWS ...', stream_name)
+        client.create_stream(StreamName=stream_name, ShardCount=1)
+        aws.wait_for_stream_status(stream_name=stream_name, status='ACTIVE')
+
+        expected_messages = set('Message {0}'.format(i) for i in range(10))
+        # not using PartitionKey logic and hence assign some temp key
+        put_records = [{'Data': exp_msg, 'PartitionKey': '111'} for exp_msg in expected_messages]
+        client.put_records(Records=put_records, StreamName=stream_name)
+
+        sdc_executor.start_pipeline(consumer_origin_pipeline).wait_for_pipeline_output_records_count(10)
+
+        # messages are published, read through the pipeline and assert
+        snapshot = sdc_executor.capture_snapshot(consumer_origin_pipeline).snapshot
+        sdc_executor.stop_pipeline(consumer_origin_pipeline)
+
+        output_records = [record.field['text'].value
+                          for record in snapshot[kinesis_consumer.instance_name].output]
+
+        assert set(output_records) == expected_messages
+
+        expected_messages = set('Message B {0}'.format(i) for i in range(10))
+        # not using PartitionKey logic and hence assign some temp key
+        put_records = [{'Data': exp_msg, 'PartitionKey': '111'} for exp_msg in expected_messages]
+        client.put_records(Records=put_records, StreamName=stream_name)
+
+        sdc_executor.start_pipeline(consumer_origin_pipeline).wait_for_pipeline_output_records_count(10)
+
+        # messages are published, read through the pipeline and assert
+        snapshot = sdc_executor.capture_snapshot(consumer_origin_pipeline).snapshot
+        sdc_executor.stop_pipeline(consumer_origin_pipeline)
+
+        output_records = [record.field['text'].value
+                          for record in snapshot[kinesis_consumer.instance_name].output]
+
+        assert set(output_records) == expected_messages
+
+    finally:
+        logger.info('Deleting %s Kinesis stream on AWS ...', stream_name)
+        client.delete_stream(StreamName=stream_name)  # Stream operations are done. Delete the stream.
+        logger.info('Deleting %s DynamoDB table on AWS ...', application_name)
+        aws.dynamodb.delete_table(TableName=application_name)
+
+
+@aws('kinesis')
 def test_kinesis_producer(sdc_builder, sdc_executor, aws):
     """Test for Kinesis producer target stage. We do so by publishing data to a test stream using Kinesis producer
-    stage and then read the data from that stream using Kinesis client. We assert the data from the client to what has
-    been ingested by the producer pipeline. The pipeline looks like:
+    stage. Then we stop the pipeline and then read the data from that stream using Kinesis client. We assert the
+    data from the client to what has been ingested by the producer pipeline. Then we add more data, stop the pipelina
+    and we assert the second batch data was readed. The pipeline looks like:
 
     Kinesis Producer pipeline:
         dev_raw_data_source >> kinesis_producer
@@ -206,7 +281,8 @@ def get_kinesis_producer_pipeline(sdc_builder, aws, stream_name, message, pipeli
     kinesis_producer.set_attributes(data_format='TEXT', stream_name=stream_name)
 
     dev_raw_data_source >> kinesis_producer
-    producer_dest_pipeline = builder.build(title=f'Kinesis Producer Pipeline {pipeline_suffix}').configure_for_environment(aws)
+    producer_dest_pipeline = builder.build(
+        title=f'Kinesis Producer Pipeline {pipeline_suffix}').configure_for_environment(aws)
 
     return producer_dest_pipeline
 
@@ -266,8 +342,15 @@ def _run_test_s3_destination(sdc_builder, sdc_executor, aws, sse_kms):
                                       server_side_encryption_option='KMS',
                                       aws_kms_key_arn=aws.kms_key_arn)
 
+    # TLKT-248: Add ability to directly read events from snapshots
+    identity = builder.add_stage('Dev Identity')
+    trash = builder.add_stage('Trash')
+
     dev_raw_data_source >> record_deduplicator >> s3_destination
     record_deduplicator >> to_error
+
+    s3_destination >= identity
+    identity >> trash
 
     s3_dest_pipeline = builder.build(title='Amazon S3 destination pipeline').configure_for_environment(aws)
     sdc_executor.add_pipeline(s3_dest_pipeline)
@@ -275,8 +358,13 @@ def _run_test_s3_destination(sdc_builder, sdc_executor, aws, sse_kms):
     client = aws.s3
     try:
         # start pipeline and capture pipeline messages to assert
-        sdc_executor.start_pipeline(s3_dest_pipeline).wait_for_pipeline_output_records_count(1)
+        snapshot = sdc_executor.capture_snapshot(s3_dest_pipeline, start_pipeline=True).snapshot
         sdc_executor.stop_pipeline(s3_dest_pipeline)
+
+        # Validate event generation
+        assert len(snapshot[identity].output) == 1
+        assert snapshot[identity].output[0].get_field_data('/bucket') == aws.s3_bucket_name
+        assert snapshot[identity].output[0].get_field_data('/recordCount') == 1
 
         # assert record count to S3 the size of the objects put
         list_s3_objs = client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)
@@ -569,7 +657,7 @@ def test_firehose_destination_to_s3(sdc_builder, sdc_executor, aws):
         resp = firehose_client.describe_delivery_stream(DeliveryStreamName=stream_name)
         dests = resp['DeliveryStreamDescription']['Destinations'][0]
         wait_secs = dests['ExtendedS3DestinationDescription']['BufferingHints']['IntervalInSeconds']
-        time.sleep(wait_secs+15)  # few seconds more to wait to make sure S3 gets the data
+        time.sleep(wait_secs + 15)  # few seconds more to wait to make sure S3 gets the data
 
         # Firehose S3 object naming http://docs.aws.amazon.com/firehose/latest/dev/basic-deliver.html#s3-object-name
         # read data to assert
@@ -698,6 +786,7 @@ def _test_emr_origin_to_s3(sdc_builder, sdc_executor, aws, pipeline_configs):
                                    for k in client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_output_key)['Contents']]}
         client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
 
+
 @aws('sqs')
 @sdc_min_version('3.0.0.0')
 def test_standard_sqs_consumer(sdc_builder, sdc_executor, aws):
@@ -741,3 +830,65 @@ def test_standard_sqs_consumer(sdc_builder, sdc_executor, aws):
         if queue_url:
             logger.info('Deleting %s SQS queue of %s URL on AWS ...', queue_name, queue_url)
             client.delete_queue(QueueUrl=queue_url)
+
+
+@aws('s3')
+def test_s3_whole_file_transfer(sdc_builder, sdc_executor, aws):
+    """Test simple scenario of moving files from source to target using WHOLE_FILE_FORMAT."""
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/'
+    s3_dest_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/'
+    data = 'Completely random string that is transfered as whole file format.'
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    origin = builder.add_stage('Amazon S3', type='origin')
+    origin.set_attributes(bucket=aws.s3_bucket_name, data_format='WHOLE_FILE',
+                          prefix_pattern=f'{s3_key}/*',
+                          max_batch_size_in_records=100)
+
+    target = builder.add_stage('Amazon S3', type='destination')
+    target.set_attributes(bucket=aws.s3_bucket_name, data_format='WHOLE_FILE', partition_prefix=s3_dest_key,
+                          file_name_expression='output.txt')
+
+    # TLKT-248: Add ability to directly read events from snapshots
+    identity = builder.add_stage('Dev Identity')
+    trash = builder.add_stage('Trash')
+
+    finisher = builder.add_stage('Pipeline Finisher Executor')
+    finisher.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    origin >> target
+    origin >= finisher
+    target >= identity
+    identity >> trash
+
+    pipeline = builder.build().configure_for_environment(aws)
+    pipeline.configuration['shouldRetry'] = False
+    sdc_executor.add_pipeline(pipeline)
+
+    client = aws.s3
+    try:
+        client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/input.txt', Body=data.encode('ascii'))
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+
+        # Validate event generation
+        assert len(snapshot[identity].output) == 1
+        assert snapshot[identity].output[0].get_field_data('/targetFileInfo/bucket') == aws.s3_bucket_name
+        assert snapshot[identity].output[0].get_field_data(
+            '/targetFileInfo/objectKey') == f'{s3_dest_key}sdc-output.txt'
+
+        # We should have exactly one file on the destination side
+        list_s3_objs = client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_dest_key)
+        assert len(list_s3_objs['Contents']) == 1
+
+        # With our secret message
+        s3_obj_key = client.get_object(Bucket=aws.s3_bucket_name, Key=list_s3_objs['Contents'][0]['Key'])
+        s3_contents = s3_obj_key['Body'].read().decode().strip()
+        assert s3_contents == data
+    finally:
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in
+                                   client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)

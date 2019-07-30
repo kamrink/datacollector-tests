@@ -93,11 +93,11 @@ def test_jdbc_multitable_consumer_origin_simple(sdc_builder, sdc_executor, datab
 
 
 @database
-def test_jdbc_query_no_more_data(sdc_builder, sdc_executor, database):
-    """
-    This test case uses the JDBC Query origin.
-    Test that Pipeline Finisher works.
-    """
+def test_jdbc_consumer_offset_resume(sdc_builder, sdc_executor, database):
+    """Ensure that the Query consumer can resume where it ended and stop the pipeline when it reads all the data."""
+    if isinstance(database, OracleDatabase):
+        pytest.skip('This test does not support oracle and its upper casing of column names.')
+
     metadata = sqlalchemy.MetaData()
     table_name = get_random_string(string.ascii_lowercase, 20)
     table = sqlalchemy.Table(
@@ -109,27 +109,88 @@ def test_jdbc_query_no_more_data(sdc_builder, sdc_executor, database):
 
     pipeline_builder = sdc_builder.get_pipeline_builder()
 
-    jdbc_query_consumer = pipeline_builder.add_stage('JDBC Query Consumer')
-    jdbc_query_consumer.configuration['isIncrementalMode'] = False
-    jdbc_query_consumer.sql_query = 'SELECT * FROM {0}'.format(table_name)
+    origin = pipeline_builder.add_stage('JDBC Query Consumer')
+    origin.incremental_mode = True
+    origin.sql_query = 'SELECT * FROM {0} WHERE '.format(table_name) + 'id > ${OFFSET} ORDER BY id'
+    origin.initial_offset = '0'
+    origin.offset_column = 'id'
 
     trash = pipeline_builder.add_stage('Trash')
-    jdbc_query_consumer >> trash
+    origin >> trash
 
     finisher = pipeline_builder.add_stage("Pipeline Finisher Executor")
-    jdbc_query_consumer >= finisher
+    origin >= finisher
+
+    pipeline = pipeline_builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
 
     try:
-        logger.info('Jdbc No More Data: Creating table %s in %s database ...', table_name, database.type)
+        logger.info('Creating table %s in %s database ...', table_name, database.type)
         table.create(database.engine)
+        connection = database.engine.connect()
 
+        for i in range(len(ROWS_IN_DATABASE)):
+            # Insert one row to the database
+            connection.execute(table.insert(), [ROWS_IN_DATABASE[i]])
+
+            snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+            assert len(snapshot[origin].output) == 1
+            assert snapshot[origin].output[0].get_field_data('/id') == i + 1
+
+            # TLKT-249: Add wait_for_finished to get_status object
+            sdc_executor.get_pipeline_status(pipeline).wait_for_status('FINISHED')
+    finally:
+        logger.info('Dropping table %s in %s database...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+def test_jdbc_consumer_non_incremental_mode(sdc_builder, sdc_executor, database):
+    """Ensure that the Query consumer works properly in non-incremental mode."""
+    if database.type == 'Oracle':
+        pytest.skip("This test depends on proper case for column names that Oracle auto-uppers.")
+
+    metadata = sqlalchemy.MetaData()
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = sqlalchemy.Table(
+        table_name,
+        metadata,
+        sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('name', sqlalchemy.String(32))
+    )
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    origin = pipeline_builder.add_stage('JDBC Query Consumer')
+    origin.incremental_mode = False
+    origin.sql_query = 'SELECT * FROM {0}'.format(table_name)
+
+    trash = pipeline_builder.add_stage('Trash')
+    origin >> trash
+
+    finisher = pipeline_builder.add_stage("Pipeline Finisher Executor")
+    origin >= finisher
+
+    pipeline = pipeline_builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        logger.info('Creating table %s in %s database ...', table_name, database.type)
+        table.create(database.engine)
         connection = database.engine.connect()
         connection.execute(table.insert(), ROWS_IN_DATABASE)
 
-        pipeline = pipeline_builder.build().configure_for_environment(database)
-        sdc_executor.add_pipeline(pipeline)
-        sdc_executor.start_pipeline(pipeline).wait_for_finished()
+        # Run the pipeline N times, it should always read the same
+        for i in range(3):
+            snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+            assert len(snapshot[origin].output) == len(ROWS_IN_DATABASE)
 
+            assert snapshot[origin].output[0].get_field_data('/id') == 1
+            assert snapshot[origin].output[1].get_field_data('/id') == 2
+            assert snapshot[origin].output[2].get_field_data('/id') == 3
+
+            # TLKT-249: Add wait_for_finished to get_status object
+            sdc_executor.get_pipeline_status(pipeline).wait_for_status('FINISHED')
     finally:
         logger.info('Jdbc No More Data: Dropping table %s in %s database...', table_name, database.type)
         table.drop(database.engine)
@@ -208,12 +269,12 @@ def test_jdbc_multitable_consumer_with_no_more_data_event_generation_delay(sdc_b
     pipeline_builder = sdc_builder.get_pipeline_builder()
     jdbc_multitable_consumer = pipeline_builder.add_stage('JDBC Multitable Consumer')
     jdbc_multitable_consumer.no_more_data_event_generation_delay_in_seconds = 1
-    jdbc_multitable_consumer.table_configs=[{"tablePattern": f'%{src_table}%'}]
+    jdbc_multitable_consumer.table_configs = [{"tablePattern": f'%{src_table}%'}]
 
     trash = pipeline_builder.add_stage('Trash')
 
     delay = pipeline_builder.add_stage('Delay')
-    delay.delay_between_batches = 10*1000
+    delay.delay_between_batches = 10 * 1000
     delay.stage_record_preconditions = ['${record:eventType() == "no-more-data"}']
 
     trash_event = pipeline_builder.add_stage('Trash')
@@ -261,7 +322,7 @@ def test_jdbc_multitable_consumer_with_no_more_data_event_generation_delay(sdc_b
         # Only no-more-data event should reach the destination
         assert history.latest.metrics.counter('stage.Trash_02.inputRecords.counter').count == 1
         # The max batch time should be slightly more then 10 (the delayed batch that we have caused)
-        #TODO: TLKT-167: Add access methods to metric objects
+        # TODO: TLKT-167: Add access methods to metric objects
         assert history.latest.metrics.timer('pipeline.batchProcessing.timer')._data.get('max') >= 10
     finally:
         if table is not None:
@@ -464,7 +525,7 @@ def test_jdbc_tee_processor(sdc_builder, sdc_executor, database):
 
 @database
 @pytest.mark.parametrize('use_multi_row', [True, False])
-@sdc_min_version('3.0.0.0') #stop_after_first_batch
+@sdc_min_version('3.0.0.0')  # stop_after_first_batch
 def test_jdbc_tee_processor_multi_ops(sdc_builder, sdc_executor, database, use_multi_row):
     """JDBC Tee processor with multiple operations
     Pipeline will delete/update/insert records into database with one batch and then update 'id'
@@ -481,9 +542,9 @@ def test_jdbc_tee_processor_multi_ops(sdc_builder, sdc_executor, database, use_m
     table_name = get_random_string(string.ascii_lowercase, 20)
     pipeline_builder = sdc_builder.get_pipeline_builder()
     DATA = [
-        {'operation': 2, 'name': 'Jarcec', 'id': 2}, # delete
-        {'operation': 3, 'name': 'Hari', 'id': 3}, # update
-        {'operation': 1, 'name': 'Eddie'} # insert, id will be added by JDBC Tee
+        {'operation': 2, 'name': 'Jarcec', 'id': 2},  # delete
+        {'operation': 3, 'name': 'Hari', 'id': 3},  # update
+        {'operation': 1, 'name': 'Eddie'}  # insert, id will be added by JDBC Tee
     ]
     dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
     dev_raw_data_source.set_attributes(data_format='JSON',
@@ -524,16 +585,16 @@ def test_jdbc_tee_processor_multi_ops(sdc_builder, sdc_executor, database, use_m
         sequence_id = len(ROWS_IN_DATABASE)
         # Verify the database is updated.
         result = database.engine.execute(table.select())
-        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
         result.close()
         expected_data = [(row['name'], row['id']) for row in ROWS_IN_DATABASE]
         for record in DATA:
-            if record['operation'] == 1: # insert
+            if record['operation'] == 1:  # insert
                 sequence_id += 1
                 expected_data.append((record['name'], sequence_id))
-            elif record['operation'] == 2: # delete
+            elif record['operation'] == 2:  # delete
                 expected_data = [row for row in expected_data if row[1] != record['id']]
-            elif record['operation'] == 3: # update
+            elif record['operation'] == 3:  # update
                 expected_data = [row if row[1] != record['id'] else (record['name'], row[1]) for row in expected_data]
         assert data_from_database == expected_data
 
@@ -585,9 +646,66 @@ def test_jdbc_query_executor(sdc_builder, sdc_executor, database):
         sdc_executor.stop_pipeline(pipeline)
 
         result = database.engine.execute(table.select())
-        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
         result.close()
         assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE]
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.10.0')
+@pytest.mark.parametrize('enable_parallel_execution', [True, False])
+def test_jdbc_query_executor_parallel_query_execution(sdc_builder, sdc_executor, database, enable_parallel_execution):
+    """Test JDBC Query Executor's parallel query execution mode.
+
+    Pipeline will insert records into database, then update the records.
+    Using sqlalchemy, we verify that correct data was inserted (and updated) in the database.
+
+    Pipeline configuration:
+        dev_raw_data_source >> jdbc_query_executor
+    """
+
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = _create_table(table_name, database)
+
+    # first, the inserts - they will run in parallel,
+    # then all the updates will run sequentially
+    # net result is all records should get updated to the (last) new value.
+    # otherwise we've failed.
+    statements = []
+    for rec in ROWS_IN_DATABASE:
+        statements.extend([f"INSERT INTO {table_name} (name, id) VALUES ('{rec['name']}', {rec['id']})",
+                           f"UPDATE {table_name} SET name = 'bob' WHERE id = {rec['id']}",
+                           f"UPDATE {table_name} SET name = 'Merrick' WHERE id = {rec['id']}"])
+    # convert to string - Dev Raw Data Source Data Format tab does not seem
+    # to "unroll" the array into newline-terminated records.
+    statements = "\n".join(statements)
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='TEXT', raw_data=statements)
+
+    jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
+    jdbc_query_executor.set_attributes(sql_query="${record:value('/text')}",
+                                       enable_parallel_queries=enable_parallel_execution,
+                                       maximum_pool_size=2,
+                                       minimum_idle_connections=2)
+
+    dev_raw_data_source >> jdbc_query_executor
+
+    pipeline = pipeline_builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        sdc_executor.start_pipeline(pipeline).wait_for_pipeline_output_records_count(len(ROWS_IN_DATABASE)*3)
+        sdc_executor.stop_pipeline(pipeline)
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        result.close()
+        assert data_from_database == [('Merrick', record['id']) for record in ROWS_IN_DATABASE]
     finally:
         logger.info('Dropping table %s in %s database ...', table_name, database.type)
         table.drop(database.engine)
@@ -639,9 +757,142 @@ def test_jdbc_producer_insert(sdc_builder, sdc_executor, database):
         sdc_executor.stop_pipeline(pipeline)
 
         result = database.engine.execute(table.select())
-        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
         result.close()
         assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE]
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+def test_jdbc_producer_insert_type_err(sdc_builder, sdc_executor, database):
+    """Simple JDBC Producer test with INSERT operation.
+    The pipeline inserts two correct records into the database and verify that correct data is in the database.
+    The pipeline inserts one wrong type record and verify the error is produced
+    The pipeline should look like:
+        dev_raw_datasource >> jdbc_producer
+    """
+
+    ROWS_IN_DATABASE = [
+        {'id': 1, 'name': 'Dima'},
+        {'id': 'X', 'name': 'Jarcec'},
+        {'id': 3, 'name': 'Arvind'}
+    ]
+
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = _create_table(table_name, database)
+
+    DATA = '\n'.join(json.dumps(rec) for rec in ROWS_IN_DATABASE)
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='JSON', raw_data=DATA, stop_after_first_batch=True)
+
+    FIELD_MAPPINGS = [dict(field='/id', columnName='id', dataType='INTEGER'),
+                      dict(field='/name', columnName='name', dataType='STRING')]
+    jdbc_producer = pipeline_builder.add_stage('JDBC Producer')
+    jdbc_producer.set_attributes(default_operation='INSERT',
+                                 table_name=table_name,
+                                 field_to_column_mapping=FIELD_MAPPINGS,
+                                 stage_on_record_error='TO_ERROR')
+
+    dev_raw_data_source >> jdbc_producer
+
+    pipeline = pipeline_builder.build(title="JDBC producer with error")
+
+    sdc_executor.add_pipeline(pipeline.configure_for_environment(database))
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.get_pipeline_status(pipeline).wait_for_status('FINISHED')
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+
+        assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE
+                                      if record['id'] != 'X']
+
+        stage = snapshot[jdbc_producer.instance_name]
+
+        assert 'JDBC_23' == stage.error_records[0].header['errorCode']
+
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+def test_jdbc_producer_insert_multiple_types(sdc_builder, sdc_executor, database):
+    """Simple JDBC Producer test with INSERT operation.
+    The pipeline inserts 1000 records of multiple types.
+    The pipeline should look like:
+        dev_data_generator >> jdbc_producer
+    """
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    dev_data_generator = pipeline_builder.add_stage('Dev Data Generator')
+    dev_data_generator.fields_to_generate = [
+        {'field': 'field1', 'type': 'STRING'},
+        {'field': 'field2', 'type': 'DATETIME'},
+        {'field': 'field3', 'type': 'INTEGER'},
+        {'field': 'field4', 'precision': 10, 'scale': 2, 'type': 'DECIMAL'},
+        {'field': 'field5', 'type': 'DOUBLE'}
+    ]
+    batch_size = 10000
+    dev_data_generator.set_attributes(delay_between_batches=0, batch_size=batch_size)
+
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    metadata = sqlalchemy.MetaData()
+
+    table = sqlalchemy.Table(table_name,
+                             metadata,
+                             sqlalchemy.Column('field1', sqlalchemy.String(50)),
+                             sqlalchemy.Column('field2', sqlalchemy.DateTime),
+                             sqlalchemy.Column('field3', sqlalchemy.Integer),
+                             sqlalchemy.Column('field4', sqlalchemy.DECIMAL(10, 2)),
+                             sqlalchemy.Column('field5', sqlalchemy.Float),
+                             schema=None)
+
+    logger.info('Creating table %s in %s database ...', table_name, database.type)
+    table.create(database.engine)
+
+    FIELD_MAPPINGS = [dict(field='/field1', columnName='field1', dataType='STRING'),
+                      dict(field='/field2', columnName='field2', dataType='DATETIME'),
+                      dict(field='/field3', columnName='field3', dataType='INTEGER'),
+                      dict(field='/field4', columnName='field4', dataType='DECIMAL'),
+                      dict(field='/field5', columnName='field5', dataType='FLOAT')]
+
+    jdbc_producer = pipeline_builder.add_stage('JDBC Producer')
+    jdbc_producer.set_attributes(default_operation='INSERT',
+                                 table_name=table_name,
+                                 field_to_column_mapping=FIELD_MAPPINGS,
+                                 stage_on_record_error='TO_ERROR')
+
+    dev_data_generator >> jdbc_producer
+
+    pipeline = pipeline_builder.build(title="JDBC producer multiple types")
+
+    sdc_executor.add_pipeline(pipeline.configure_for_environment(database))
+
+    try:
+
+        sdc_executor.start_pipeline(pipeline).wait_for_pipeline_output_records_count(batch_size, timeout_sec=3600)
+        snapshot = sdc_executor.capture_snapshot(pipeline).snapshot
+        sdc_executor.stop_pipeline(pipeline).wait_for_stopped()
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+
+        assert len(data_from_database) > batch_size
+
+        stage = snapshot[jdbc_producer.instance_name]
+
+        assert len(stage.error_records) == 0
+
     finally:
         logger.info('Dropping table %s in %s database ...', table_name, database.type)
         table.drop(database.engine)
@@ -745,7 +996,7 @@ def test_jdbc_producer_coerced_insert(sdc_builder, sdc_executor, database):
         sdc_executor.stop_pipeline(pipeline)
 
         result = database.engine.execute(table.select())
-        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
         result.close()
         assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE]
     finally:
@@ -779,7 +1030,8 @@ def test_jdbc_producer_delete(sdc_builder, sdc_executor, database):
         data_from_database = result.fetchall()
         result.close()
         removed_ids = [record['id'] for record in ROWS_TO_UPDATE]
-        assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE if record['id'] not in removed_ids]
+        assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE if
+                                      record['id'] not in removed_ids]
     finally:
         logger.info('Dropping table %s in %s database ...', table_name, database.type)
         table.drop(database.engine)
@@ -808,7 +1060,7 @@ def test_jdbc_producer_update(sdc_builder, sdc_executor, database):
         sdc_executor.stop_pipeline(pipeline)
 
         result = database.engine.execute(table.select())
-        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
         result.close()
         updated_names = {record['id']: record['name'] for record in ROWS_IN_DATABASE}
         updated_names.update({record['id']: record['name'] for record in ROWS_TO_UPDATE})
@@ -829,7 +1081,7 @@ def test_jdbc_multitable_consumer_initial_offset_at_the_end(sdc_builder, sdc_exe
     builder = sdc_builder.get_pipeline_builder()
 
     jdbc_multitable_consumer = builder.add_stage('JDBC Multitable Consumer')
-    jdbc_multitable_consumer.table_configs=[{
+    jdbc_multitable_consumer.table_configs = [{
         "tablePattern": table_name,
         "overrideDefaultOffsetColumns": True,
         "offsetColumns": ["id"],
@@ -997,7 +1249,8 @@ def test_jdbc_producer_multitable(sdc_builder, sdc_executor, database):
         result3.close()
 
     finally:
-        logger.info('Dropping tables %s, %s, %s in %s database...', table1_name, table2_name, table3_name, database.type)
+        logger.info('Dropping tables %s, %s, %s in %s database...', table1_name, table2_name, table3_name,
+                    database.type)
         table1.drop(database.engine)
         table2.drop(database.engine)
         table3.drop(database.engine)
@@ -1250,7 +1503,7 @@ def test_jdbc_producer_ordering(sdc_builder, sdc_executor, multi_row, database):
         sdc_executor.start_pipeline(pipeline).wait_for_finished()
 
         result = database.engine.execute(table.select())
-        db = sorted(result.fetchall(), key=lambda row: row[0]) # order by id
+        db = sorted(result.fetchall(), key=lambda row: row[0])  # order by id
         result.close()
 
         assert len(db) == 2
@@ -1286,7 +1539,7 @@ def test_jdbc_multitable_events(sdc_builder, sdc_executor, database):
     builder = sdc_builder.get_pipeline_builder()
     source = builder.add_stage('JDBC Multitable Consumer')
     source.transaction_isolation = 'TRANSACTION_READ_COMMITTED'
-    source.table_configs=[{
+    source.table_configs = [{
         'tablePattern': f'{table_prefix}%',
         "enableNonIncremental": True,
         'tableExclusionPattern': table_events
@@ -1295,16 +1548,16 @@ def test_jdbc_multitable_events(sdc_builder, sdc_executor, database):
     trash = builder.add_stage('Trash')
 
     expression = builder.add_stage('Expression Evaluator')
-    expression.field_expressions = [ {
-        'fieldToSet' : '/tbl',
-        'expression' : '${record:value("/table")}${record:value("/tables[0]")}'
-      }, {
-        'fieldToSet' : '/tbls',
-        'expression' : '${record:value("/tables[0]")},${record:value("/tables[1]")}'
-      }, {
-        'fieldToSet' : '/event',
-        'expression' : '${record:eventType()}'
-      }
+    expression.field_expressions = [{
+        'fieldToSet': '/tbl',
+        'expression': '${record:value("/table")}${record:value("/tables[0]")}'
+    }, {
+        'fieldToSet': '/tbls',
+        'expression': '${record:value("/tables[0]")},${record:value("/tables[1]")}'
+    }, {
+        'fieldToSet': '/event',
+        'expression': '${record:eventType()}'
+    }
     ]
 
     producer = builder.add_stage('JDBC Producer')
@@ -1361,7 +1614,7 @@ def test_jdbc_multitable_events(sdc_builder, sdc_executor, database):
         status.wait_for_pipeline_output_records_count(6)
 
         result = database.engine.execute(events.select())
-        db = sorted(result.fetchall(), key=lambda row: row[0]) # order by stamp
+        db = sorted(result.fetchall(), key=lambda row: row[0])  # order by stamp
         result.close()
         assert len(db) == 4
 
@@ -1393,7 +1646,7 @@ def test_jdbc_multitable_events(sdc_builder, sdc_executor, database):
         status.wait_for_pipeline_output_records_count(10)
 
         result = database.engine.execute(events.select())
-        db = sorted(result.fetchall(), key=lambda row: row[0]) # order by stamp
+        db = sorted(result.fetchall(), key=lambda row: row[0])  # order by stamp
         result.close()
         assert len(db) == 3
 
@@ -1477,7 +1730,7 @@ def test_jdbc_producer_oracle_data_errors(sdc_builder, sdc_executor, multi_row, 
 
         # The table in database needs to be empty
         result = database.engine.execute(table.select())
-        db = sorted(result.fetchall(), key=lambda row: row[0]) # order by id
+        db = sorted(result.fetchall(), key=lambda row: row[0])  # order by id
         result.close()
         assert len(db) == 0
 
@@ -1496,16 +1749,16 @@ def test_jdbc_producer_oracle_data_errors(sdc_builder, sdc_executor, multi_row, 
 # https://docs.oracle.com/cd/B28359_01/server.111/b28318/datatype.htm#CNCPT1821
 # We don't support UriType (requires difficult workaround in JDBC)
 @pytest.mark.parametrize('sql_type,insert_fragment,expected_type,expected_value', [
-    ('number','1', 'DECIMAL', '1'),
+    ('number', '1', 'DECIMAL', '1'),
     ('char(2)', "'AB'", 'STRING', 'AB'),
     ('varchar(4)', "'ABCD'", 'STRING', 'ABCD'),
     ('varchar2(4)', "'NVAR'", 'STRING', 'NVAR'),
-    ('nchar(3)',"'NCH'", 'STRING', 'NCH'),
+    ('nchar(3)', "'NCH'", 'STRING', 'NCH'),
     ('nvarchar2(4)', "'NVAR'", 'STRING', 'NVAR'),
     ('binary_float', '1.0', 'FLOAT', '1.0'),
     ('binary_double', '2.0', 'DOUBLE', '2.0'),
-    ('date', "TO_DATE('1998-1-1 6:22:33', 'YYYY-MM-DD HH24:MI:SS')", 'DATETIME', 883664553000),
-    ('timestamp', "TIMESTAMP'1998-1-2 6:00:00'", 'DATETIME', 883749600000),
+    ('date', "TO_DATE('1998-1-1 6:22:33', 'YYYY-MM-DD HH24:MI:SS')", 'DATETIME', 883635753000),
+    ('timestamp', "TIMESTAMP'1998-1-2 6:00:00'", 'DATETIME', 883720800000),
     ('timestamp with time zone', "TIMESTAMP'1998-1-3 6:00:00-5:00'", 'ZONED_DATETIME', '1998-01-03T06:00:00-05:00'),
     ('timestamp with local time zone', "TIMESTAMP'1998-1-4 6:00:00-5:00'", 'ZONED_DATETIME', '1998-01-04T07:00:00Z'),
     ('long', "'LONG'", 'STRING', 'LONG'),
@@ -1515,7 +1768,8 @@ def test_jdbc_producer_oracle_data_errors(sdc_builder, sdc_executor, multi_row, 
     ('XMLType', "xmltype('<a></a>')", 'STRING', '<a></a>')
 ])
 @pytest.mark.parametrize('use_table_origin', [True, False])
-def test_jdbc_multitable_oracle_types(sdc_builder, sdc_executor, database, use_table_origin, sql_type, insert_fragment, expected_type, expected_value):
+def test_jdbc_multitable_oracle_types(sdc_builder, sdc_executor, database, use_table_origin, sql_type, insert_fragment,
+                                      expected_type, expected_value):
     """Test all feasible Oracle types."""
     table_name = get_random_string(string.ascii_lowercase, 20)
     connection = database.engine.connect()
@@ -1582,7 +1836,7 @@ def test_jdbc_multitable_duplicate_offsets(sdc_builder, sdc_executor, database):
     pipeline_builder = sdc_builder.get_pipeline_builder()
 
     origin = pipeline_builder.add_stage('JDBC Multitable Consumer')
-    origin.table_configs=[{"tablePattern": table_name}]
+    origin.table_configs = [{"tablePattern": table_name}]
     origin.max_batch_size_in_records = 1
 
     trash = pipeline_builder.add_stage('Trash')
@@ -1639,7 +1893,7 @@ def test_jdbc_multitable_lost_nonincremental_offset(sdc_builder, sdc_executor, d
     pipeline_builder = sdc_builder.get_pipeline_builder()
 
     origin = pipeline_builder.add_stage('JDBC Multitable Consumer')
-    origin.table_configs=[{"tablePattern": table_name, "enableNonIncremental": True}]
+    origin.table_configs = [{"tablePattern": table_name, "enableNonIncremental": True}]
     origin.max_batch_size_in_records = 1
 
     trash = pipeline_builder.add_stage('Trash')
@@ -1864,6 +2118,7 @@ def test_jdbc_multitable_consumer_origin_high_resolution_timestamp_offset(sdc_bu
         logger.info('Dropping table %s in %s database...', table_name, database.type)
         connection.execute(f'DROP TABLE {table_name}')
 
+
 @database
 def test_jdbc_multitable_consumer_partitioned_large_offset_gaps(sdc_builder, sdc_executor, database):
     """
@@ -1875,13 +2130,16 @@ def test_jdbc_multitable_consumer_partitioned_large_offset_gaps(sdc_builder, sdc
 
     This is a test for SDC-10053
     """
+    if database.type == 'Oracle':
+        pytest.skip("This test depends on proper case for column names that Oracle auto-uppers.")
+
     src_table_prefix = get_random_string(string.ascii_lowercase, 6)
     table_name = '{}_{}'.format(src_table_prefix, get_random_string(string.ascii_lowercase, 20))
 
     pipeline_builder = sdc_builder.get_pipeline_builder()
 
     jdbc_multitable_consumer = pipeline_builder.add_stage('JDBC Multitable Consumer')
-    jdbc_multitable_consumer.set_attributes(table_configs = [{
+    jdbc_multitable_consumer.set_attributes(table_configs=[{
         "tablePattern": f'{table_name}',
         "enableNonIncremental": False,
         "partitioningMode": "REQUIRED",
@@ -1919,8 +2177,8 @@ def test_jdbc_multitable_consumer_partitioned_large_offset_gaps(sdc_builder, sdc
         # need to capture two batches, one for row IDs 1-3, and one for the last row after the large gap
         snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, batches=2, start_pipeline=True).snapshot
         rows_from_snapshot = [(record.get_field_data('/name').value, record.get_field_data('/id').value)
-                               for batch in snapshot.snapshot_batches
-                               for record in batch.stage_outputs[jdbc_multitable_consumer.instance_name].output]
+                              for batch in snapshot.snapshot_batches
+                              for record in batch.stage_outputs[jdbc_multitable_consumer.instance_name].output]
 
         expected_data = [(row['name'], row['id']) for row in rows_with_gap]
         logger.info('Actual %s expected %s', rows_from_snapshot, expected_data)
@@ -1929,3 +2187,349 @@ def test_jdbc_multitable_consumer_partitioned_large_offset_gaps(sdc_builder, sdc
         logger.info('Dropping table %s in %s database...', table_name, database.type)
         table.drop(database.engine)
 
+
+@sdc_min_version('3.0.0.0')
+@database('mysql')
+# https://dev.mysql.com/doc/refman/8.0/en/data-types.html
+# We don't support BIT generally (the driver is doing funky 'random' mappings on certain versions)
+@pytest.mark.parametrize('sql_type,insert_fragment,expected_type,expected_value', [
+    ('TINYINT', '-128', 'SHORT', -128),
+    ('TINYINT UNSIGNED', '255', 'SHORT', 255),
+    ('SMALLINT', '-32768', 'SHORT', -32768),
+    ('SMALLINT UNSIGNED', '65535', 'SHORT', -1),  # Support for unsigned isn't entirely correct!
+    ('MEDIUMINT', '-8388608', 'INTEGER', '-8388608'),
+    ('MEDIUMINT UNSIGNED', '16777215', 'INTEGER', '16777215'),
+    ('INT', '-2147483648', 'INTEGER', '-2147483648'),
+    ('INT UNSIGNED', '4294967295', 'INTEGER', '-1'),  # Support for unsigned isn't entirely correct!
+    ('BIGINT', '-9223372036854775807', 'LONG', '-9223372036854775807'),
+    ('BIGINT UNSIGNED', '18446744073709551615', 'LONG', '-1'),  # Support for unsigned isn't entirely correct!
+    ('DECIMAL(5, 2)', '5.20', 'DECIMAL', '5.20'),
+    ('NUMERIC(5, 2)', '5.20', 'DECIMAL', '5.20'),
+    ('FLOAT', '5.2', 'FLOAT', '5.2'),
+    ('DOUBLE', '5.2', 'DOUBLE', '5.2'),
+    #    ('BIT(8)',"b'01010101'", 'BYTE_ARRAY', 'VQ=='),
+    ('DATE', "'2019-01-01'", 'DATE', 1546300800000),
+    ('DATETIME', "'2019-01-01 5:00:00'", 'DATETIME', 1546318800000),
+    ('TIMESTAMP', "'2019-01-01 5:00:00'", 'DATETIME', 1546318800000),
+    ('TIME', "'5:00:00'", 'TIME', 18000000),
+    ('YEAR', "'2019'", 'DATE', 1546300800000),
+    ('CHAR(5)', "'Hello'", 'STRING', 'Hello'),
+    ('VARCHAR(5)', "'Hello'", 'STRING', 'Hello'),
+    ('BINARY(5)', "'Hello'", 'BYTE_ARRAY', 'SGVsbG8='),
+    ('VARBINARY(5)', "'Hello'", 'BYTE_ARRAY', 'SGVsbG8='),
+    ('BLOB', "'Hello'", 'BYTE_ARRAY', 'SGVsbG8='),
+    ('TEXT', "'Hello'", 'STRING', 'Hello'),
+    ("ENUM('a', 'b')", "'a'", 'STRING', 'a'),
+    ("set('a', 'b')", "'a,b'", 'STRING', 'a,b'),
+    ("POINT", "POINT(1, 1)", 'BYTE_ARRAY', 'AAAAAAEBAAAAAAAAAAAA8D8AAAAAAADwPw=='),
+    ("LINESTRING", "LineString(Point(0,0), Point(10,10), Point(20,25), Point(50,60))", 'BYTE_ARRAY',
+     'AAAAAAECAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkQAAAAAAAACRAAAAAAAAANEAAAAAAAAA5QAAAAAAAAElAAAAAAAAATkA='),
+    ("POLYGON",
+     "Polygon(LineString(Point(0,0),Point(10,0),Point(10,10),Point(0,10),Point(0,0)),LineString(Point(5,5),Point(7,5),Point(7,7),Point(5,7),Point(5,5)))",
+     'BYTE_ARRAY',
+     'AAAAAAEDAAAAAgAAAAUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEAAAAAAAAAAAAAAAAAAACRAAAAAAAAAJEAAAAAAAAAAAAAAAAAAACRAAAAAAAAAAAAAAAAAAAAAAAUAAAAAAAAAAAAUQAAAAAAAABRAAAAAAAAAHEAAAAAAAAAUQAAAAAAAABxAAAAAAAAAHEAAAAAAAAAUQAAAAAAAABxAAAAAAAAAFEAAAAAAAAAUQA=='),
+    ("JSON", "'{\"a\":\"b\"}'", 'STRING', '{\"a\": \"b\"}'),
+])
+@pytest.mark.parametrize('use_table_origin', [True, False])
+def test_jdbc_multitable_mysql_types(sdc_builder, sdc_executor, database, use_table_origin, sql_type, insert_fragment,
+                                     expected_type, expected_value):
+    """Test all feasible Mysql types."""
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    connection = database.engine.connect()
+    try:
+        # Create table
+        connection.execute(f"""
+            CREATE TABLE {table_name}(
+                id int primary key,
+                data_column {sql_type} NULL
+            )
+        """)
+
+        # And insert a row with actual value
+        connection.execute(f"INSERT INTO {table_name} VALUES(1, {insert_fragment})")
+        # And a null
+        connection.execute(f"INSERT INTO {table_name} VALUES(2, NULL)")
+
+        builder = sdc_builder.get_pipeline_builder()
+
+        if use_table_origin:
+            origin = builder.add_stage('JDBC Multitable Consumer')
+            origin.table_configs = [{"tablePattern": f'%{table_name}%'}]
+            origin.on_unknown_type = 'CONVERT_TO_STRING'
+        else:
+            origin = builder.add_stage('JDBC Query Consumer')
+            origin.sql_query = 'SELECT * FROM {0}'.format(table_name)
+            origin.incremental_mode = False
+            origin.on_unknown_type = 'CONVERT_TO_STRING'
+
+        trash = builder.add_stage('Trash')
+
+        origin >> trash
+
+        pipeline = builder.build(f"MySQL Type {sql_type} with value {insert_fragment}").configure_for_environment(
+            database)
+        sdc_executor.add_pipeline(pipeline)
+
+        snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert len(snapshot[origin].output) == 2
+        record = snapshot[origin].output[0]
+        null_record = snapshot[origin].output[1]
+
+        # Since we are controlling types, we want to check explicit values inside the record rather the the python
+        # wrappers.
+        # TLKT-177: Add ability for field to return raw value
+
+        assert record.field['data_column'].type == expected_type
+        assert null_record.field['data_column'].type == expected_type
+
+        assert record.field['data_column']._data['value'] == expected_value
+        assert null_record.field['data_column'] == None
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        connection.execute(f"DROP TABLE {table_name}")
+
+
+@sdc_min_version('3.0.0.0')
+@database('postgresql')
+# https://www.postgresql.org/docs/11/datatype.html
+# Not testing 'serial' family explicitly as that is just an alias
+# Not supporting tsvector tsquery as that doesn't seem fit for us
+# bit(n) is not supported
+# xml is not supported
+# domain types (as a category are not supported)
+# pg_lsn not supported
+@pytest.mark.parametrize('sql_type,insert_fragment,expected_type,expected_value', [
+    ('smallint', '-32768', 'SHORT', -32768),
+    ('integer', '2147483647', 'INTEGER', '2147483647'),
+    ('bigint', '-9223372036854775808', 'LONG', '-9223372036854775808'),
+    ('decimal(5,2)', '5.20', 'DECIMAL', '5.20'),
+    ('numeric(5,2)', '5.20', 'DECIMAL', '5.20'),
+    ('real', '5.20', 'FLOAT', '5.2'),
+    ('double precision', '5.20', 'DOUBLE', '5.2'),
+    ('money', '12.34', 'DOUBLE', '12.34'),
+    ('char(5)', "'Hello'", 'STRING', 'Hello'),
+    ('varchar(5)', "'Hello'", 'STRING', 'Hello'),
+    ('text', "'Hello'", 'STRING', 'Hello'),
+    ('bytea', "'\\xDEADBEEF'", 'BYTE_ARRAY', '3q2+7w=='),
+    ('timestamp', "'2003-04-12 04:05:06'", 'DATETIME', 1050120306000),
+    ('timestamp with time zone', "'2003-04-12 04:05:06 America/New_York'", 'DATETIME', 1050134706000),
+    # For PostgreSQL, we don't create ZONED_DATETIME
+    ('date', "'2019-01-01'", 'DATE', 1546300800000),
+    ('time', "'5:00:00'", 'TIME', 18000000),
+    ('time with time zone', "'04:05:06-08:00'", 'TIME', 43506000),
+    ('interval', "INTERVAL '1' YEAR", 'STRING', '1 years 0 mons 0 days 0 hours 0 mins 0.00 secs'),
+    ('boolean', "true", 'BOOLEAN', True),
+    ('ai', "'sad'", 'STRING', 'sad'),
+    ('point', "'(1, 1)'", 'STRING', '(1.0,1.0)'),
+    ('line', "'{1, 1, 1}'", 'STRING', '{1.0,1.0,1.0}'),
+    ('lseg', "'((1,1)(2,2))'", 'STRING', '[(1.0,1.0),(2.0,2.0)]'),
+    ('box', "'(1,1)(2,2)'", 'STRING', '(2.0,2.0),(1.0,1.0)'),
+    ('path', "'((1,1),(2,2))'", 'STRING', '((1.0,1.0),(2.0,2.0))'),
+    ('polygon', "'((1,1),(2,2))'", 'STRING', '((1.0,1.0),(2.0,2.0))'),
+    ('circle', "'<(1,1),5>'", 'STRING', '<(1.0,1.0),5.0>'),
+    ('inet', "'127.0.0.1/16'", 'STRING', '127.0.0.1/16'),
+    ('cidr', "'127.0.0.0/16'", 'STRING', '127.0.0.0/16'),
+    ('macaddr', "'08:00:2b:01:02:03'", 'STRING', '08:00:2b:01:02:03'),
+    #    ('macaddr8', "'08:00:2b:01:02:03'", 'STRING', '08:00:2b:ff:fe:01:02:03'),
+    #    ('bit(8)', "b'10101010'", 'BYTE_ARRAY', '08:00:2b:ff:fe:01:02:03'), # Doesn't work at all today
+    ('bit varying(3)', "b'101'", 'STRING', '101'),
+    ('uuid', "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'", 'STRING', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
+    #    ('xml', "'<foo>bar</foo>'", 'STRING', ''), # Doesn't work properly today
+    ("json", "'{\"a\":\"b\"}'", 'STRING', '{"a":"b"}'),
+    ("jsonb", "'{\"a\":\"b\"}'", 'STRING', '{"a": "b"}'),
+    ("integer[3][3]", "'{{1,2,3},{4,5,6},{7,8,9}}'", 'STRING', '{{1,2,3},{4,5,6},{7,8,9}}'),
+    ("ct", "ROW(1, 2)", 'STRING', '(1,2)'),
+    ("int4range", "'[1,2)'", 'STRING', '[1,2)'),
+    ("int8range", "'[1,2)'", 'STRING', '[1,2)'),
+    ("numrange", "'[1,2)'", 'STRING', '[1,2)'),
+    ("tsrange", "'[2010-01-01 14:30, 2010-01-01 15:30)'", 'STRING', '["2010-01-01 14:30:00","2010-01-01 15:30:00")'),
+    ("tstzrange", "'[2010-01-01 14:30 America/New_York, 2010-01-01 15:30 America/New_York)'", 'STRING',
+     '["2010-01-01 19:30:00+00","2010-01-01 20:30:00+00")'),
+    ("daterange", "'[2010-01-01, 2010-01-02)'", 'STRING', '[2010-01-01,2010-01-02)'),
+])
+@pytest.mark.parametrize('use_table_origin', [True, False])
+def test_jdbc_postgresql_types(sdc_builder, sdc_executor, database, use_table_origin, sql_type, insert_fragment,
+                               expected_type, expected_value):
+    """Test all feasible PostgreSQL types."""
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    connection = database.engine.connect()
+    try:
+        # Create enum type conditionally
+        connection.execute(f"""
+            DO
+            $$
+            BEGIN
+              IF NOT EXISTS (SELECT * FROM pg_type typ
+                                      INNER JOIN pg_namespace nsp ON nsp.oid = typ.typnamespace
+                                      WHERE nsp.nspname = current_schema() AND typ.typname = 'ai') THEN
+                CREATE TYPE ai AS ENUM ('sad', 'ok', 'happy');
+              END IF;
+            END;
+            $$
+            LANGUAGE plpgsql;        
+        """)
+
+        # Create enum complex type conditionally
+        connection.execute(f"""
+            DO
+            $$
+            BEGIN
+              IF NOT EXISTS (SELECT * FROM pg_type typ
+                                      INNER JOIN pg_namespace nsp ON nsp.oid = typ.typnamespace
+                                      WHERE nsp.nspname = current_schema() AND typ.typname = 'ct') THEN
+                CREATE TYPE ct AS (a int, b int);
+              END IF;
+            END;
+            $$
+            LANGUAGE plpgsql;        
+        """)
+
+        # Create table
+        connection.execute(f"""
+            CREATE TABLE {table_name}(
+                id int primary key,
+                data_column {sql_type} NULL
+            )
+        """)
+
+        # And insert a row with actual value
+        connection.execute(f"INSERT INTO {table_name} VALUES(1, {insert_fragment})")
+        # And a null
+        connection.execute(f"INSERT INTO {table_name} VALUES(2, NULL)")
+
+        builder = sdc_builder.get_pipeline_builder()
+
+        if use_table_origin:
+            origin = builder.add_stage('JDBC Multitable Consumer')
+            origin.table_configs = [{"tablePattern": f'%{table_name}%'}]
+            origin.on_unknown_type = 'CONVERT_TO_STRING'
+        else:
+            origin = builder.add_stage('JDBC Query Consumer')
+            origin.sql_query = 'SELECT * FROM {0}'.format(table_name)
+            origin.incremental_mode = False
+            origin.on_unknown_type = 'CONVERT_TO_STRING'
+
+        trash = builder.add_stage('Trash')
+
+        origin >> trash
+
+        pipeline = builder.build().configure_for_environment(database)
+        sdc_executor.add_pipeline(pipeline)
+
+        snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert len(snapshot[origin].output) == 2
+        record = snapshot[origin].output[0]
+        null_record = snapshot[origin].output[1]
+
+        # Since we are controlling types, we want to check explicit values inside the record rather the the python
+        # wrappers.
+        # TLKT-177: Add ability for field to return raw value
+
+        assert record.field['data_column'].type == expected_type
+        assert null_record.field['data_column'].type == expected_type
+
+        assert record.field['data_column']._data['value'] == expected_value
+        assert null_record.field['data_column'] == None
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        connection.execute(f"DROP TABLE {table_name}")
+
+
+@sdc_min_version('3.0.0.0')
+@database('sqlserver')
+# https://docs.microsoft.com/en-us/sql/t-sql/data-types/data-types-transact-sql?view=sql-server-2017
+# hiearchyid types not supported
+# Geometry and geography not supported
+@pytest.mark.parametrize('sql_type,insert_fragment,expected_type,expected_value', [
+    ('DATE', "'2019-01-01'", 'DATE', 1546300800000),
+    ('DATETIME', "'2004-05-23T14:25:10'", 'DATETIME', 1085322310000),
+    ('DATETIME2', "'2004-05-23T14:25:10'", 'DATETIME', 1085322310000),
+    ('DATETIMEOFFSET', "'2004-05-23T14:25:10'", 'STRING', '2004-05-23 14:25:10 +00:00'),
+    ('SMALLDATETIME', "'2004-05-23T14:25:10'", 'DATETIME', 1085322300000),
+    ('TIME', "'14:25:10'", 'TIME', 51910000),
+    ('BIT', "1", 'BOOLEAN', True),
+    ('DECIMAL(5,2)', '5.20', 'DECIMAL', '5.20'),
+    ('NUMERIC(5,2)', '5.20', 'DECIMAL', '5.20'),
+    ('REAL', '5.20', 'FLOAT', '5.2'),
+    ('FLOAT', '5.20', 'DOUBLE', '5.2'),
+    ('TINYINT', '255', 'SHORT', 255),
+    ('SMALLINT', '-32768', 'SHORT', -32768),
+    ('INT', '-2147483648', 'INTEGER', '-2147483648'),
+    ('BIGINT', '-9223372036854775807', 'LONG', '-9223372036854775807'),
+    ('MONEY', '255.60', 'DECIMAL', '255.6000'),
+    ('SMALLMONEY', '255.60', 'DECIMAL', '255.6000'),
+    ('BINARY(5)', "CAST('Hello' AS BINARY(5))", 'BYTE_ARRAY', 'SGVsbG8='),
+    ('VARBINARY(5)', "CAST('Hello' AS VARBINARY(5))", 'BYTE_ARRAY', 'SGVsbG8='),
+    ('CHAR(5)', "'Hello'", 'STRING', 'Hello'),
+    ('VARCHAR(5)', "'Hello'", 'STRING', 'Hello'),
+    ('NCHAR(5)', "'Hello'", 'STRING', 'Hello'),
+    ('NVARCHAR(5)', "'Hello'", 'STRING', 'Hello'),
+    ('TEXT', "'Hello'", 'STRING', 'Hello'),
+    ('NTEXT', "'Hello'", 'STRING', 'Hello'),
+    ('IMAGE', "CAST('Hello' AS IMAGE)", 'BYTE_ARRAY', 'SGVsbG8='),
+    #    ('GEOGRAPHY',"geography::STGeomFromText('LINESTRING(-122.360 47.656, -122.343 47.656 )', 4326)", 'BYTE_ARRAY', '5hAAAAEUhxbZzvfTR0DXo3A9CpdewIcW2c7300dAy6FFtvOVXsA='),
+    #    ('GEOMETRY',"geometry::STGeomFromText('LINESTRING (100 100, 20 180, 180 180)', 0)", 'BYTE_ARRAY', 'AAAAAAEEAwAAAAAAAAAAAFlAAAAAAAAAWUAAAAAAAAA0QAAAAAAAgGZAAAAAAACAZkAAAAAAAIBmQAEAAAABAAAAAAEAAAD/////AAAAAAI='),
+    ('XML', "'<a></a>'", 'STRING', '<a/>')
+])
+@pytest.mark.parametrize('use_table_origin', [True, False])
+def test_jdbc_sqlserver_types(sdc_builder, sdc_executor, database, use_table_origin, sql_type, insert_fragment,
+                              expected_type, expected_value):
+    """Test all feasible SQL Server types."""
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    connection = database.engine.connect()
+    try:
+        # Create table
+        connection.execute(f"""
+            CREATE TABLE {table_name}(
+                id int primary key,
+                data_column {sql_type} NULL
+            )
+        """)
+
+        # And insert a row with actual value
+        connection.execute(f"INSERT INTO {table_name} VALUES(1, {insert_fragment})")
+        # And a null
+        connection.execute(f"INSERT INTO {table_name} VALUES(2, NULL)")
+
+        builder = sdc_builder.get_pipeline_builder()
+
+        if use_table_origin:
+            origin = builder.add_stage('JDBC Multitable Consumer')
+            origin.table_configs = [{"tablePattern": f'%{table_name}%'}]
+            origin.on_unknown_type = 'CONVERT_TO_STRING'
+        else:
+            origin = builder.add_stage('JDBC Query Consumer')
+            origin.sql_query = 'SELECT * FROM {0}'.format(table_name)
+            origin.incremental_mode = False
+            origin.on_unknown_type = 'CONVERT_TO_STRING'
+
+        trash = builder.add_stage('Trash')
+
+        origin >> trash
+
+        pipeline = builder.build().configure_for_environment(database)
+        sdc_executor.add_pipeline(pipeline)
+
+        snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert len(snapshot[origin].output) == 2
+        record = snapshot[origin].output[0]
+        null_record = snapshot[origin].output[1]
+
+        # Since we are controlling types, we want to check explicit values inside the record rather the the python
+        # wrappers.
+        # TLKT-177: Add ability for field to return raw value
+
+        assert record.field['data_column'].type == expected_type
+        assert null_record.field['data_column'].type == expected_type
+
+        assert record.field['data_column']._data['value'] == expected_value
+        assert null_record.field['data_column'] == None
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        connection.execute(f"DROP TABLE {table_name}")
